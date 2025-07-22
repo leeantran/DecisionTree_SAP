@@ -1,0 +1,573 @@
+---
+title: "NLR - CRP - BISAP"
+author: "An Tran"
+date: "2024-10-06"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE, fig.dpi=800,fig.path="figures/"}
+knitr::opts_chunk$set(echo = F, warning = F, dpi=300, fig.width = 6)
+library(randomForest)
+library(gtsummary)
+library(pROC)
+library(rsample)
+library(ggplot2)
+library(ggsci)
+library(rms)
+library(dcurves)
+library(survival)
+library(tidyverse)
+library(Hmisc)
+library(readxl)
+library(tidymodels)
+library(rpart)
+library(rpart.plot)
+
+
+df1 <- read_excel("C:/Users/ADMIN/Desktop/Projects/SAP/data/data.xls", sheet = 2)
+df1 <- as.data.frame(df1)
+```
+
+## Clean data
+
+```{r}
+df <- filter(df1, crp != 0)
+df <- mutate(df, nlr = neu/lym)
+df$phando2 <- factor(df$phando2, levels = c(0,1), labels = c(0,1))
+df$sap <- factor(df$phando2, levels = c(0,1), labels = c("Non servere", "Severe"))
+df$sirs <- factor(df$sirs, levels = c(0,1), labels = c(0,1))
+df$tdmp <- as.factor(df$tdmp)
+df$gioi <- as.factor(df$gioi)
+df$nguyennhan <- as.factor(df$nguyennhan)
+df$nn1 <- ifelse(df$nguyennhan==1,1,0)
+df$nn2 <- ifelse(df$nguyennhan==2,1,0)
+df$nn3 <- ifelse(df$nguyennhan==3,1,0)
+df$nn4 <- ifelse(df$nguyennhan==4,1,0)
+df$nn5 <- ifelse(df$nguyennhan==5,1,0)
+df$nn1 <- as.factor(df$nn1)
+df$nn2 <- as.factor(df$nn2)
+df$nn3 <- as.factor(df$nn3)
+df$nn4 <- as.factor(df$nn4)
+df$nn5 <- as.factor(df$nn5)
+```
+
+## Devide data into 60% training set and 40% validation set
+
+```{r}
+set.seed(234)
+samp <- sample(c(TRUE, FALSE), nrow(df), replace = TRUE, prob = c(0.6,0.4))
+train <- df[samp, ]
+test <- df[!samp, ]
+```
+
+```{r}
+train$type <- "train"
+test$type <- "test"
+df <- full_join(train, test)
+df$type <- as.factor(df$type)
+```
+
+## Descriptive summary
+
+```{r}
+tbl_summary(df, by = type, include = c(gioi, hct, tdmp, nguyennhan, tha,
+                                       dtd, bisap, nanggia, tudich,
+                                       hoaitutuy, hoaituwall,
+                                       ketcuoc, phando2, sirs),
+            missing = "no",
+            digits = c(all_continuous() ~ 1,
+                       all_categorical() ~ c(0,1)),
+            statistic =  list(all_continuous() ~ "{mean} ({sd})")) %>%
+  add_p(pvalue_fun = function(x) style_pvalue(x, digits = 3),
+                    test = list(all_continuous() ~ "t.test", 
+                                all_categorical() ~ "fisher.test")) %>%
+  add_overall()
+```
+
+```{r}
+tbl_summary(df, by = type, include = c(tuoi, nlr, crp, lym, bun, cre, neu,
+                                       lym, wbc, tri,lipase, amylase, ctsi),
+            missing = "no",
+             digits = c(all_continuous() ~ 1,
+                         all_categorical() ~ c(0,1)),
+              statistic =  list(all_continuous() ~ "{median} ({p25}-{p75})")) %>%
+  add_p(pvalue_fun = function(x) style_pvalue(x, digits = 3),
+                    test = list(all_continuous() ~ "wilcox.test",
+                                all_categorical() ~ "fisher.test")) %>%
+  add_overall()
+```
+
+## Heatmap
+
+```{r}
+library(GGally)
+df_pairs <- df %>%
+  select(nlr, crp, bisap, phando2) %>%
+  mutate(across(c(nlr, crp, bisap), as.numeric),
+         phando2 = factor(phando2, levels = c(0, 1), labels = c("Non-Severe", "Severe")))
+
+ggpairs(df_pairs,
+        columns = 1:3,
+        columnLabels = c("NLR", "CRP", "BISAP"),
+        aes(color = phando2, alpha = 0.7),
+        upper = list(continuous = wrap("cor", method = "spearman")),
+        lower = list(continuous = "points"),
+        diag = list(continuous = "densityDiag")) +
+  theme(
+    strip.text = element_text(size = 14, color = "black"),
+    axis.text = element_text(size = 14, color = "black"),
+    axis.title = element_text(size = 14, color = "black"),
+    legend.text = element_text(size = 14, color = "black"),
+    legend.title = element_text(size = 14, color = "black")
+  )
+```
+
+## Violin plot for CLR and BISAP
+
+### Training data
+
+```{r}
+violin_nlr_train <- ggplot(train, aes(x=sap, y=nlr, fill=sap)) + 
+  geom_violin(trim=FALSE) + scale_fill_manual(values = c( "#E69F00", "#56B4E9")) +
+  geom_boxplot(width=0.1, fill="gray")+
+  labs(x="Severity of Acute Pancreatitis", 
+       y = "NLR value") +
+  theme_classic() + 
+  theme(legend.position = "none", 
+        legend.title = element_text(face = "bold"))
+```
+
+``` {r}
+violin_crp_train <- ggplot(train, aes(x=sap, y=crp, fill=sap)) + 
+  geom_violin(trim=FALSE) + scale_fill_manual(values = c( "#E69F00", "#56B4E9")) +
+  geom_boxplot(width=0.1, fill="gray")+
+  labs(x="Severity of Acute Pancreatitis", 
+       y = "CRP value") +
+  theme_classic() + 
+  theme(legend.position = "none", 
+        legend.title = element_text(face = "bold"))
+```
+
+### Testing data
+
+```{r}
+violin_nlr_test <- ggplot(test, aes(x=sap, y=nlr, fill=sap)) + 
+  geom_violin(trim=FALSE) + scale_fill_manual(values = c( "#E69F00", "#56B4E9")) +
+  geom_boxplot(width=0.1, fill="gray")+
+  labs(x="Severity of Acute Pancreatitis", 
+       y = "NLR value") +
+  theme_classic() + 
+  theme(legend.position = "none", 
+        legend.title = element_text(face = "bold"))
+```
+
+``` {r}
+violin_crp_test <- ggplot(test, aes(x=sap, y=crp, fill=sap)) + 
+  geom_violin(trim=FALSE) + scale_fill_manual(values = c( "#E69F00", "#56B4E9")) +
+  geom_boxplot(width=0.1, fill="gray")+
+  labs(x="Severity of Acute Pancreatitis", 
+       y = "CRP value") +
+  theme_classic() + 
+  theme(legend.position = "none", 
+        legend.title = element_text(face = "bold"))
+```
+
+## Build models
+
+```{r}
+train$phando2 <- factor(train$phando2, levels = c(0,1), labels = c("nonsap", "sap"))
+test$phando2 <- factor(test$phando2, levels = c(0,1), labels = c("nonsap", "sap"))
+library(caret)
+kfold <- trainControl(method = "cv",
+                      number = 10,
+                      savePredictions = "all",
+                      classProbs = TRUE) 
+
+m_nlr <- train(phando2 ~ nlr, data = train,
+               method = "glm", family = "binomial",
+               trControl = kfold)
+
+m_bisap <- train(phando2 ~ bisap, data = train, 
+               method = "glm", family = "binomial",
+               trControl = kfold)
+
+m_crp <- train(phando2 ~ crp, data = train,
+             method = "glm", family = "binomial",
+               trControl = kfold)
+
+m_nlr_crp <- train(phando2 ~ nlr + crp, data = train,
+                 method = "glm", family = "binomial",
+               trControl = kfold)
+
+m_neu <- train(phando2 ~ neu, data = train,
+             method = "glm", family = "binomial",
+               trControl = kfold)
+
+m_lym<- train(phando2 ~ lym, data = train,
+             method = "glm", family = "binomial",
+               trControl = kfold)
+```
+
+## Predict models
+
+```{r}
+p_nlr <- predict(m_nlr, test, type = "prob")
+roc_nlr <- roc(test$phando2, p_nlr[,2])
+
+p_bisap <- predict(m_bisap, test, type = "prob")
+roc_bisap <- roc(test$phando2, p_bisap[,2])
+
+p_crp <- predict(m_crp, test, type = "prob")
+roc_crp <- roc(test$phando2, p_crp[,2])
+
+p_nlr_crp <- predict(m_nlr_crp, test, type = "prob")
+roc_nlr_crp <- roc(test$phando2, p_nlr_crp[,2])
+
+p_neu <- predict(m_neu, test, type = "prob")
+roc_neu <- roc(test$phando2, p_neu[,2])
+
+p_lym <- predict(m_lym, test, type = "prob")
+roc_lym <- roc(test$phando2, p_lym[,2])
+```
+
+## ROC Curves NLR, CRP and Combined
+
+### Training cohort
+
+```{r}
+p_nlr_train <- predict(m_nlr, train, type = "prob")
+roc_nlr_train <- roc(train$phando2, p_nlr_train[,2])
+
+p_bisap_train <- predict(m_bisap, train, type = "prob")
+roc_bisap_train <- roc(train$phando2, p_bisap_train[,2])
+
+p_crp_train <- predict(m_crp, train, type = "prob")
+roc_crp_train <- roc(train$phando2, p_crp_train[,2])
+
+p_nlr_crp_train <- predict(m_nlr_crp, train, type = "prob")
+roc_nlr_crp_train <- roc(train$phando2, p_nlr_crp_train[,2])
+```
+
+```{r}
+size_text_roc <- 4
+x_text_roc <- 0.65
+y_text_roc <- 0.25
+roc.list_train <- list(roc_nlr_train,roc_crp_train, roc_nlr_crp_train)
+ggroc(roc.list_train, aes = "color", size = 1, linetype = "solid", legacy.axes = TRUE) +
+    annotate("text", x = x_text_roc, y = y_text_roc, size = size_text_roc, hjust = 0, 
+             color = "#1f77b4",
+             label = paste0("NLR = ", sprintf("%.3f", roc_nlr_train$auc))) +
+    annotate("text", x = x_text_roc, y = y_text_roc - 0.1, size = size_text_roc, hjust = 0, 
+             color = "#ff7f0e",
+             label = paste0("CRP = ", sprintf("%.3f", roc_crp_train$auc))) +
+    annotate("text", x = x_text_roc, y = y_text_roc - 0.2, size = size_text_roc, hjust = 0, 
+             color = "#d340a2",
+             label = paste0("NLR + CRP = ", sprintf("%.3f", roc_nlr_crp_train$auc))) +
+    geom_segment(aes(x = 0, xend = 1, y = 0, yend = 1),
+                 color = "darkgrey", linetype = "dashed", size = 0.8) +  # Đường y=x
+    theme_classic() +
+    theme(text = element_text(size = 14),
+          legend.position = "bottom",
+          legend.title = element_blank()) +
+    scale_color_bmj(name = "Model", 
+labels = c("NLR", "CRP", "NLR + CRP")) +
+    labs(x = "1 - Specificity", y = "Sensitivity") +
+    theme_minimal()
+```
+
+### Validation cohort
+
+```{r}
+size_text_roc <- 4
+x_text_roc <- 0.65
+y_text_roc <- 0.25
+roc.list <- list(roc_nlr, roc_crp, roc_nlr_crp)
+ggroc(roc.list, aes = "color", size = 1, linetype = "solid", legacy.axes = TRUE) +
+    annotate("text", x = x_text_roc, y = y_text_roc, size = size_text_roc, hjust = 0, 
+             color = "#1f77b4",
+             label = paste0("NLR = ", sprintf("%.3f", roc_nlr$auc))) +
+    annotate("text", x = x_text_roc, y = y_text_roc - 0.1, size = size_text_roc, hjust = 0, 
+             color = "#ff7f0e",
+             label = paste0("CRP = ", sprintf("%.3f", roc_crp$auc))) +
+    annotate("text", x = x_text_roc, y = y_text_roc - 0.2, size = size_text_roc, hjust = 0, 
+             color = "#d340a2",
+             label = paste0("NLR + CRP = ", sprintf("%.3f", roc_nlr_crp$auc))) +
+    geom_segment(aes(x = 0, xend = 1, y = 0, yend = 1),
+                 color = "darkgrey", linetype = "dashed", size = 0.8) +  # Đường y=x
+    theme_classic() +
+    theme(text = element_text(size = 14),
+          legend.position = "bottom",
+          legend.title = element_blank()) +
+    scale_color_bmj(name = "Model", 
+labels = c("NLR", "CRP", "NLR + CRP")) +
+    labs(x = "1 - Specificity", y = "Sensitivity") +
+    theme_minimal()
+```
+
+### Compare ROC Curve
+
+```{r}
+roc.test(roc_nlr, roc_crp)
+roc.test(roc_nlr_crp, roc_nlr)
+roc.test(roc_nlr_crp, roc_crp)
+```
+
+## Cut-off for NLR
+
+### Training
+
+```{r}
+cpnlr_train <- cutpointr::cutpointr(data = train, x = nlr, class = phando2, metric = cutpointr::youden)
+summary(cpnlr_train)
+```
+
+### Validation
+
+```{r}
+cpnlr_test <- cutpointr::cutpointr(data = test, x = nlr, class = phando2, 
+                                   metric = cutpointr::youden)
+summary(cpnlr_test)
+```
+
+## Cut-off for CRP
+
+### Training
+
+```{r}
+cpcrp_train <- cutpointr::cutpointr(data = train, x = crp, class = phando2, 
+                                    metric = cutpointr::youden)
+summary(cpcrp_train)
+```
+
+### Validation
+
+```{r}
+cpcrp_test <- cutpointr::cutpointr(data = test, x = crp, class = phando2, 
+                                   metric = cutpointr::youden)
+summary(cpcrp_test)
+```
+
+## Decision tree for NLR and CRP
+
+```{r}
+set.seed(234)
+tree_fit <- rpart(phando2 ~  nlr + crp, data = train,
+              control = rpart.control(cp = 0.0001))
+
+printcp(tree_fit)
+
+best <- tree_fit$cptable[which.min(tree_fit$cptable[,"xerror"]),"CP"]
+
+pruned_tree_fit <- prune(tree_fit, cp = best)
+
+prp(pruned_tree_fit,
+    faclen=0,
+    extra=101,
+    under = T,
+    cex = 0.8,
+    box.palette = "auto",
+    roundint=F,
+    digits=5)
+
+predictions <- predict(tree_fit, test, type = "class")
+
+confusionMatrix(predictions, test$phando2)
+```
+
+## Odds Ratio
+
+### Training data
+
+```{r}
+train$phando2 <- ifelse(train$phando2=="nonsap", 0, 1)
+
+dff <- train[,c("nlr", "crp", "phando2", "tuoi", "gioi", 
+               "nguyennhan", "dtd", "wbc")]
+
+dff <- dff %>% 
+  mutate(
+    nlr_or = ifelse(nlr>=11.4,1,0),
+    crp_or = ifelse(crp>=174.7,1,0),
+    combine_or = case_when(
+      nlr < 11.4 ~ 1,
+      nlr >= 11.4 & crp < 173.3 ~ 2,
+      nlr >= 11.4 & crp >= 173.3 ~ 3)
+  )
+
+dff <- dff %>% mutate(across(.cols = -c(nlr, crp, tuoi, wbc), .fns = as.factor))
+
+# Univariate 
+tbl_uvregression(dff[,-c(1,2,4,5,6,7,8)],
+                 method = glm,
+                 y = phando2,
+                 method.args = list(family = binomial),
+                 exponentiate = TRUE)
+
+## Multivariate - adjusted for age, sex, etiology, diabetes, wbc
+glm(phando2 ~ nlr_or + tuoi + gioi + nguyennhan + dtd + wbc, data = dff, family = binomial(link = "logit")) %>%
+  tbl_regression(exponentiate = TRUE)
+
+glm(phando2 ~ crp_or + tuoi + gioi + nguyennhan + dtd + wbc, data = dff, family = binomial(link = "logit")) %>%
+  tbl_regression(exponentiate = TRUE)
+
+glm(phando2 ~ combine_or + tuoi + gioi + nguyennhan + dtd + wbc, data = dff, family = binomial(link = "logit")) %>%
+  tbl_regression(exponentiate = TRUE)
+```
+
+### Testing data
+
+```{r}
+test$phando2 <- ifelse(test$phando2=="nonsap", 0, 1)
+
+dff <- test[,c("nlr", "crp", "phando2", "tuoi", "gioi", 
+               "nguyennhan", "dtd", "wbc")]
+
+dff <- dff %>% 
+  mutate(
+    nlr_or = ifelse(nlr>=11.43,1,0),
+    crp_or = ifelse(crp>=174.7,1,0),
+    combine_or = case_when(
+      nlr < 11.4 ~ 1,
+      nlr >= 11.4 & crp < 173.3 ~ 2,
+      nlr >= 11.4 & crp >= 173.3 ~ 3)
+  )
+
+dff$phando2 <- ifelse(dff$phando2=="nonsap", 0, 1)
+
+# Univariate 
+tbl_uvregression(dff[,-c(1,2,3,4,5,6,7))],
+                 method = glm,
+                 y = phando2,
+                 method.args = list(family = binomial),
+                 exponentiate = TRUE)
+
+## Multivariate - adjusted for age, sex, etiology, diabetes, wbc
+glm(phando2 ~ nlr_or + tuoi + gioi + nguyennhan + dtd + wbc, data = dff, family = binomial(link = "logit")) %>%
+  tbl_regression(exponentiate = TRUE)
+
+glm(phando2 ~ crp_or + tuoi + gioi + nguyennhan + dtd + wbc, data = dff, family = binomial(link = "logit")) %>%
+  tbl_regression(exponentiate = TRUE)
+
+glm(phando2 ~ combine_or + tuoi + gioi + nguyennhan + dtd + wbc, data = dff, family = binomial(link = "logit")) %>%
+  tbl_regression(exponentiate = TRUE)
+```
+
+## ROC Curves NLR + CRP and BISAP
+
+### Training cohort
+
+```{r}
+size_text_roc <- 4
+x_text_roc <- 0.65
+y_text_roc <- 0.25
+roc.list_train <- list(roc_nlr_crp_train, roc_bisap_train)
+ggroc(roc.list_train, aes = "color", size = 1, linetype = "solid", legacy.axes = TRUE) +
+    annotate("text", x = x_text_roc, y = y_text_roc, size = size_text_roc, hjust = 0, 
+             color = "#1f77b4",
+             label = paste0("NLR + CRP = ", sprintf("%.3f", roc_nlr_crp_train$auc))) +
+    annotate("text", x = x_text_roc, y = y_text_roc - 0.1, size = size_text_roc, hjust = 0, 
+             color = "#ff7f0e",
+             label = paste0("BISAP = ", sprintf("%.3f", roc_bisap_train$auc))) +
+    geom_segment(aes(x = 0, xend = 1, y = 0, yend = 1),
+                 color = "darkgrey", linetype = "dashed", size = 0.8) +  # Đường y=x
+    theme_classic() +
+    theme(text = element_text(size = 14),
+          legend.position = "bottom",
+          legend.title = element_blank()) +
+    scale_color_bmj(name = "Model", 
+labels = c("NLR + CRP", "BISAP")) +
+    labs(x = "1 - Specificity", y = "Sensitivity") +
+    theme_minimal()
+```
+
+### Validation cohort
+
+```{r}
+size_text_roc <- 4
+x_text_roc <- 0.65
+y_text_roc <- 0.25
+roc.list <- list(roc_nlr_crp, roc_bisap)
+
+ggroc(roc.list, aes = "color", size = 1, linetype = "solid", legacy.axes = TRUE) +
+    annotate("text", x = x_text_roc, y = y_text_roc, size = size_text_roc, hjust = 0, 
+             color = "#1f77b4",
+             label = paste0("NLR + CRP = ", sprintf("%.3f", roc_nlr_crp$auc))) +
+    annotate("text", x = x_text_roc, y = y_text_roc - 0.1, size = size_text_roc, hjust = 0, 
+             color = "#ff7f0e",
+             label = paste0("BISAP = ", sprintf("%.3f", roc_bisap$auc))) +
+  annotate("text", x = x_text_roc, y = y_text_roc - 0.2, size = size_text_roc, hjust = 0, 
+             color = "#ff7f0e", 
+           label = paste0("(p = 0.286)")) +
+    geom_segment(aes(x = 0, xend = 1, y = 0, yend = 1),
+                 color = "darkgrey", linetype = "dashed", size = 0.8) +  # Đường y=x
+    theme_classic() +
+    theme(text = element_text(size = 14),
+          legend.position = "bottom",
+          legend.title = element_blank()) +
+    scale_color_bmj(name = "Model", 
+labels = c("NLR + CRP", "BISAP")) +
+    labs(x = "1 - Specificity", y = "Sensitivity") +
+    theme_minimal()
+```
+
+```{r}
+roc.test(roc_nlr_crp, roc_bisap)
+```
+
+## Calibration NLR + CRP
+
+### Training set
+
+```{r}
+df_plot <- train[,c("nlr", "crp","phando2")]
+df_plot <- na.omit(df_plot)
+pred.train <- predict(m_nlr_crp, df_plot, type = "prob")
+phat.train <- pred.train[,2]
+val.prob(phat.train, as.numeric(df_plot$phando2) - 1, m=20, cex=.5)
+```
+
+### Validation set
+
+```{r}
+df_plot <- test[,c("nlr", "crp","phando2")]
+df_plot <- na.omit(df_plot)
+pred.test <- predict(m_nlr_crp, df_plot, type = "prob")
+phat.test <- pred.test[,2]
+val.prob(phat.test, as.numeric(df_plot$phando2) - 1, m=20, cex=.5)
+```
+
+## Decision curve NLR + CRP
+
+### Training set
+
+```{r}
+df_plot <- train[,c("phando2","nlr","crp","bisap")]
+df_plot <- na.omit(df_plot)
+pred1 <- predict(m_nlr_crp, newdata = df_plot, type = 'prob')
+pred2 <- predict(m_bisap, newdata = df_plot, type = 'prob')
+df_plot$pred1 <- pred1[,2]
+df_plot$pred2 <- pred2[,2]
+df_plot$phando2 <- as.numeric(df_plot$phando2) - 1
+dca(phando2 ~ pred1 + pred2,
+    data = df_plot,
+    label = list(pred1 = "NLR + CRP",
+                 pred2 = "BISAP"))
+```
+
+### Validation set
+
+```{r}
+df_plot <- test[,c("phando2","nlr","crp", "bisap")]
+df_plot <- na.omit(df_plot)
+pred1 <- predict(m_nlr_crp, newdata = df_plot, type = 'prob')
+pred2 <- predict(m_bisap, newdata = df_plot, type = 'prob')
+df_plot$pred1 <- pred1[,2]
+df_plot$pred2 <- pred2[,2]
+df_plot$phando2 <- as.numeric(df_plot$phando2) - 1
+dca(phando2 ~ pred1 + pred2,
+    data = df_plot,
+    label = list(pred1 = "NLR + CRP",
+                 pred2 = "BISAP"))
+```
